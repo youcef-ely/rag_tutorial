@@ -1,94 +1,90 @@
 import os
-import sys
-import time
-import torch
 import logging
-import pandas as pd
-from typing import Literal
+import pretty_errors
+from tqdm.notebook import tqdm
+from configs.configs import Config
 
-sys.path.append('../')
-from rag.config import Config
-from llama_parse import LlamaParse
-from llama_index.core import Settings
-from qdrant_client import QdrantClient
-from llama_index.llms.groq import Groq
-from langchain.vectorstores import Chroma
-from llama_index.core import StorageContext
-from llama_index.vector_stores.qdrant import QdrantVectorStore
-from llama_index.embeddings.fastembed import FastEmbedEmbedding
-from llama_index.core.indices.vector_store.base import VectorStoreIndex
-
-logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
-
-DEVICE = "cuda:0" if torch.cuda.is_available() else "cpu"
-
-qdrant_client = QdrantClient(
-    url = Config.QDRANT_URL,
-    prefer_grpc = True,
-    api_key = Config.QDRANT_API_KEY
-)
-
-llm = Groq(model = "llama3-70b-8192", api_key = Config.GROQ_API_KEY)
-Settings.llm = llm
-
-embed_model = FastEmbedEmbedding(model_name = "BAAI/bge-small-en-v1.5")
-Settings.embed_model = embed_model
-
-vector_store = QdrantVectorStore(client = qdrant_client, collection_name = Config.COLLECTION_NAME)
-db_index = VectorStoreIndex.from_vector_store(vector_store = vector_store)
+from langchain_chroma import Chroma
+from langchain.chains import RetrievalQA
+from langchain_huggingface import HuggingFaceEndpoint
+from langchain_huggingface import HuggingFaceEmbeddings  
+from langchain_community.document_loaders import PyPDFLoader
+from langchain.text_splitter import RecursiveCharacterTextSplitter
 
 
 
+#Initializing the global variables
+conversation_retrieval_chain = None
+chat_history = []
+llm_hub = None
+embeddings = HuggingFaceEmbeddings(model_kwargs={'device': Config.DEVICE})
+persist_directory = '../data/chroma_langchain_db'
 
-def parse_dataset(dataset_name: Literal['sustainability', 'christmas']) -> dict:
-    if not Config.LLAMA_API_KEY:
-        logging.error("LLAMA_API_KEY not found in environment variables.")
-        return {"error": "Missing API key"}
+
+
+def process_document(file_path):    
+    global embeddings, conversation_retrieval_chain, llm_hub
+
+    loader = PyPDFLoader(file_path = file_path)
+    document = loader.load()
     
-    parser = LlamaParse(api_key = Config.LLAMA_API_KEY)
+    # Text splitting
+    text_splitter = RecursiveCharacterTextSplitter(
+        separators=["\n\n", "\n", ". ", " ", ""],
+        chunk_size=1000,
+        chunk_overlap=200
+    )
 
-    try:
-        if dataset_name not in Config.DATA_PATHS:
-            raise ValueError(f"{dataset_name} dataset is not supported")
+    splits = text_splitter.split_documents(document)
+    logging.info("Text splitted successfully!")
+    
+        
+    # Create the vector store with precomputed embeddings
+    db = Chroma.from_documents(
+        collection_name=Config.COLLECTION_NAME,
+        documents=splits,
+        embedding=embeddings,
+        persist_directory=persist_directory
+    )
 
-        parser.parsing_instruction = Config.INSTRUCTIONS[dataset_name]
-        doc = parser.load_data(Config.DATA_PATHS[dataset_name])
-        logging.info(f"Successfully parsed dataset: {dataset_name}")
-        return doc
+    db.persist()
+    logging.info("Vector store created successfully!")
 
-    except FileNotFoundError as e:
-        logging.error(f"File not found: {e}")
-        return {"error": "File not found"}
-
-    except Exception as e:
-        logging.error(f"Unexpected error: {e}")
-        return {"error": str(e)}
-
-
-def embedding_doc(parsed_doc):
-    try:
-        storage_context = StorageContext.from_defaults(vector_store = vector_store)
-        VectorStoreIndex.from_documents(parsed_doc, storage_context = storage_context)
-        logging.info("Document embedded and indexed successfully.")
-    except Exception as e:
-        logging.error(f"Failed to embed and store document: {e}")
-        raise e
+    
 
 
+def process_prompt(prompt):
+    global conversation_retrieval_chain, chat_history, embeddings
 
-def retrieval_and_generate(query: str) -> dict:
-    try:
-        query_engine = db_index.as_query_engine()
-        start_time = time.time()
-        response = query_engine.query(query)
-        elapsed_time = time.time() - start_time
+    db = Chroma(
+    persist_directory=persist_directory,
+    embedding_function=embeddings)
 
-        logging.info(f"Query executed in {elapsed_time:.2f} seconds.")
-        logging.info(f"Query: {query}")
-        logging.info(f"Response: {response.response}")
+    retriever = db.as_retriever(search_type="mmr", search_kwargs={'k': 6, 'lambda_mult': 0.25})
 
-        return response.response
+    llm_hub = HuggingFaceEndpoint(repo_id=Config.GENERATOR_MODEL_NAME, 
+                                 temperature=0.1, max_new_tokens=600)
+    
+    conversation_retrieval_chain = RetrievalQA.from_chain_type(
+        llm=llm_hub,
+        chain_type="stuff",
+        retriever=retriever,
+        return_source_documents=False,
+        input_key = "question"
+    )
+    
+    # Query the model
+    output = conversation_retrieval_chain({"question": prompt, "chat_history": chat_history})
+    answer = output["result"]
+    
+    # Update the chat history
+    chat_history.append((prompt, answer))
+    
+    # Return the model's response
+    return answer
 
-    except Exception as e:
-        logging.error(f"Query failed: {e}")
-        return {"error": str(e)}
+
+
+
+
+
